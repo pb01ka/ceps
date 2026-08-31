@@ -56,20 +56,32 @@ whose computed hash matches that of a different, potentially malicious tree.
 
 Given a directory (the "scanned directory"), recursively scan all of its contents. Each individual
 regular file, each directory, and each symlink found anywhere beneath the scanned directory is one
-**entry**: a single item produced by the scan, identified by its own path relative to the scanned
-directory and contributing exactly one record of its own to the hash stream. A tree containing three
-files and two subdirectories therefore has five entries, not one. The resulting set of entries is
-what the rest of this algorithm operates on:
+**entry**: a single item produced by the scan, identified by its path relative to the scanned
+directory and contributing exactly one record to the hash stream. For example, the tree
 
-- **Regular files** are collected as entries. A regular file is the only entry type whose contents
-  participate in the hash (see [File content handling](#file-content-handling)); every other type
-  contributes only path-derived bytes.
-- **Directories** are collected as entries in their own right, in addition to the entries for
-  whatever they contain. This includes empty directories: an empty directory is collected and is
-  represented solely by its own entry, which is what makes it visible to the hash at all.
-- **Symlinks** are collected as symlinks and MUST NOT be followed. Whatever a symlink points at is
-  therefore not scanned through that symlink - only the symlink's own entry (and its target path) is
-  hashed, even when the target is a directory inside the scanned directory.
+```text
+mydir/
+├── a.txt
+├── b.txt
+├── link -> a.txt
+├── src/
+│   └── c.txt
+└── docs/
+```
+
+has six entries: `a.txt`, `b.txt`, `link`, `src`, `src/c.txt`, and `docs` -
+one per file, directory, and symlink found beneath `mydir`, not a single entry for the tree as a
+whole. The resulting set of entries is what the rest of this algorithm operates on:
+
+- **Regular files** contribute a single entry that covers the file's path and its contents (see
+  [File content handling](#file-content-handling)); every other entry type contributes only
+  path-derived bytes.
+- **Directories** contribute a single entry for the directory itself,
+including empty directories, and recursively, an entry for everything found
+  inside it.
+- **Symlinks** contribute a single entry that covers the symlink's own path and its target path, as
+  stored, without resolving the target. Symlinks MUST NOT be followed: whatever a symlink points at
+  is not scanned through it, even when the target is a directory inside the scanned directory.
 - **Any other entry type** (device nodes, FIFOs, sockets, ...) MUST cause the implementation to
   error out, per the [Hash stream](#hash-stream) rules below.
 - The scanned directory itself (`.`) MUST NOT be included as an entry.
@@ -96,8 +108,11 @@ apply to both entry paths and symlink targets:
 - Before encoding a path to UTF-8 for sorting or hashing, implementations MUST normalize it to NFC.
   If this leaves two entries with the same path, implementations MUST error out rather than silently
   feeding duplicate bytes into the hasher.
-- Backslashes in the path MUST be normalized to forward slashes (e.g. `path\\to\\file`
-  becomes `path/to/file`).
+- Backslashes MUST be normalized to forward slashes only when the raw path was obtained from a
+  platform whose native path separator is the backslash (i.e. Windows): e.g. `path\to\file` becomes
+  `path/to/file`. On every other platform, backslashes MUST be left as-is and treated as ordinary
+  filename bytes, not as directory separators (see
+  [Rationale](#why-is-backslash-normalization-platform-dependent)).
 - `.` and `..` components MUST NOT be collapsed (e.g. `foo/../bar` MUST NOT be rewritten to `bar`);
   see [Rationale](#why-not-collapse-redundant-path-components).
 
@@ -121,9 +136,16 @@ absolute path:
   components, repeated slashes, and trailing slashes MUST all be preserved verbatim, and the target
   MUST NOT be resolved against the filesystem. Two symlinks whose stored targets differ are different
   symlinks, and MUST hash differently.
-- Windows drive letters (e.g. `C:`) and UNC prefixes (e.g. `//server/share`) in a symlink target
-  MUST cause the implementation to error out, because there is no meaningful cross-platform way to
-  normalize them into the hash stream.
+- Windows drive letters (e.g. `C:`) and UNC prefixes MUST cause the implementation to error out,
+  because there is no meaningful cross-platform way to normalize them into the hash stream. A UNC
+  prefix is conventionally written with two leading backslashes (e.g. `\\server\share`). On a
+  platform where backslashes are converted to forward slashes (Windows, per the common rules above),
+  this check operates on the normalized target, so `\\server\share` becomes `//server/share` before
+  the check runs and is rejected as a leading `//`. On a platform where backslashes are left as-is
+  (see the common rules above), the same `\\server\share` target is instead rejected directly for
+  starting with a literal `\\`: a UNC prefix MUST be rejected the same way regardless of which
+  platform performed the scan (see
+  [Rationale](#why-is-backslash-normalization-platform-dependent)).
 
 ### File content handling
 
@@ -216,13 +238,19 @@ def _encode_path(path: str) -> bytes:
 
 def _normalize_path(path: str) -> str:
     # Applies the common rules in the order they are listed in the Specification: require
-    # UTF-8-encodability, reject null bytes, normalize separators, then NFC-normalize.
+    # UTF-8-encodability, reject null bytes, normalize separators (Windows only - see
+    # "Why is backslash normalization platform-dependent?"), then NFC-normalize.
     # "." and ".." components are deliberately NOT collapsed (no posixpath.normpath here):
     # for a symlink target, collapsing them changes which file the target names.
     _encode_path(path)  # raises before anything else looks at the path
     if "\0" in path:
         raise ValueError(f"path contains a null byte: {path!r}")
-    return unicodedata.normalize("NFC", path.replace("\\", "/"))
+    if os.name == "nt":
+        # NTFS disallows a literal backslash in a filename, so any backslash Windows hands
+        # back is guaranteed to be a separator. POSIX filesystems allow it as ordinary content,
+        # so it is left untouched everywhere else.
+        path = path.replace("\\", "/")
+    return unicodedata.normalize("NFC", path)
 
 
 def _normalize_entry_path(path: str) -> str:
@@ -243,7 +271,10 @@ def _normalize_symlink_target(target: str) -> str:
     # Everything the common rules don't touch is preserved verbatim: "." / ".." components,
     # repeated slashes and trailing slashes are all part of what the symlink actually stores.
     normalized = _normalize_path(target)
-    if normalized.startswith("//"):
+    # "//" is what a UNC prefix looks like once Windows' backslash conversion has run; "\\\\" is
+    # what the same prefix looks like on a platform where that conversion never touched it. Both
+    # are rejected the same way, regardless of which platform performed the scan.
+    if normalized.startswith("//") or normalized.startswith("\\\\"):
         raise ValueError(f"symlink target must not contain a UNC prefix: {normalized!r}")
     if _DRIVE_LETTER_RE.match(normalized):
         raise ValueError(f"symlink target must not contain a drive letter: {normalized!r}")
@@ -530,8 +561,8 @@ hash covers. Stopping is the only response that keeps the hash meaningful. The r
 entry paths and symlink targets part ways, since a symlink target MAY legitimately be absolute or
 contain `..`.
 
-The one transformation in the group, stripping a leading `./`, is there because some scanners report
-paths that way. It carries no information and is not a repair of a malformed path.
+The one clarification in the group is that top-level paths are added without a leading `./`,
+matching what some scanners report. It carries no information and is not a repair of a malformed path.
 
 ### Why not collapse redundant path components?
 
@@ -579,8 +610,7 @@ carry that forward: the hash covers every regular file's raw on-disk bytes, unmo
 The problem is that a file's bytes alone cannot say whether its CRLFs are meaningful content or an
 artifact of checkout-time conversion. Two files can be byte-for-byte identical on disk and still need
 opposite treatment depending on what a git index (or equivalent checkout metadata) recorded for each
-
-- information that lives outside the file and that the hash algorithm has no access to. Normalizing
+file - information that lives outside the file and that the hash algorithm has no access to. Normalizing
 line endings unconditionally treats both cases the same and erases a difference between the two files
 that genuinely exists. See
 [Appendix A](#appendix-a-why-file-bytes-do-not-reveal-which-crlfs-are-real) for a worked example.
@@ -603,8 +633,43 @@ These four bytes have a well-documented history as sources of archive-extraction
 - `:`: Significant on Windows. It introduces a drive letter or an NTFS Alternate Data Stream.
 
 This CEP treats null bytes and drive-letter/UNC colons as hard errors. It normalizes path separators
-explicitly (see Specification). Implementations are not left to independently decide - and
-potentially disagree - on how to handle these historically dangerous characters.
+explicitly, though only where doing so is unambiguous (see
+[Specification](#path-normalization) and
+[Rationale](#why-is-backslash-normalization-platform-dependent)). Implementations are not left to
+independently decide - and potentially disagree - on how to handle these historically dangerous
+characters.
+
+### Why is backslash normalization platform-dependent?
+
+Converting every backslash to a forward slash, regardless of which platform performed the directory
+scan, uses the wrong rule on Unix: POSIX filesystems only forbid `/` and `\0` in a filename component,
+so a literal backslash is a legal, unremarkable byte in a Unix filename. Rewriting it to `/` therefore
+does not remove a separator - it manufactures one. A file named `foo\bar` (a single, literal filename
+on Unix) would normalize to the same entry path, `foo/bar`, that a directory `foo` containing a file
+`bar` also normalizes to - reintroducing, via path normalization itself, the exact class of
+structural ambiguity between two different trees that the rest of this CEP exists to remove.
+
+The same problem is sharper for symlink targets, which this CEP requires to be hashed exactly "as
+stored" (see [Path normalization](#path-normalization)): a Unix symlink whose stored target contains
+a literal backslash would have that backslash silently rewritten before hashing, so the hash would no
+longer cover the target as actually stored on disk.
+
+Restricting the conversion to Windows avoids both problems while keeping the cross-platform
+reproducibility CEP 19 relied on for the common case: NTFS disallows a literal backslash inside a
+filename, so any backslash Windows hands back from a directory scan is guaranteed to be a separator,
+never content, and converting it is exactly right. A Unix tree containing a literal backslash in a
+name, meanwhile, has no Windows counterpart to begin with - NTFS cannot represent that filename - so
+there is no "same directory on both platforms" case for running the conversion on Unix to preserve.
+
+One narrow exception: a symlink target's *leading* `\\` is rejected as a UNC prefix on every
+platform, not only after Windows' backslash conversion (see
+[Path normalization](#path-normalization)). This does not contradict the argument above - it does
+not treat backslashes as separators in general. It targets one specific pattern: a target starting
+with two consecutive backslashes is recognizable as UNC-style network path syntax on any platform,
+not plausible ordinary content, so `\\server\share` is rejected the same way whether the scan ran on
+Windows or elsewhere. Every other backslash in a symlink target, and every backslash anywhere in an
+entry path, is still hashed as literal content on non-Windows platforms, per the rest of this
+section.
 
 ### Why require UTF-8-encodable paths?
 
